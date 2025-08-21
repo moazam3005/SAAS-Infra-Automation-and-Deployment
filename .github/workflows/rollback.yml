@@ -1,0 +1,41 @@
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "staging or prod"
+        required: true
+        default: "staging"
+      s3_key:
+        description: "Artifact key to deploy (default: artifacts/<env>/latest.zip)"
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Compute key
+        id: keys
+        run: |
+          ENV="${{ github.event.inputs.environment }}"
+          KEY="${{ github.event.inputs.s3_key }}"
+          if [ -z "$KEY" ]; then KEY="artifacts/${ENV}/latest.zip"; fi
+          echo "env=$ENV" >> $GITHUB_OUTPUT
+          echo "key=$KEY" >> $GITHUB_OUTPUT
+
+      - name: Rollback via SSM
+        run: |
+          aws ssm send-command             --targets "Key=tag:Environment,Values=${{ steps.keys.outputs.env }}"             --document-name "AWS-RunShellScript"             --comment "Manual rollback to ${{ steps.keys.outputs.key }}"             --parameters commands="bash -lc 'sudo bash /opt/myapp/install_app.sh ${{ steps.keys.outputs.env }} ${{ secrets.ARTIFACT_BUCKET }} ${{ steps.keys.outputs.key }}'"
