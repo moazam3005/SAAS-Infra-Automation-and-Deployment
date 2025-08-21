@@ -1,0 +1,82 @@
+#!/bin/bash
+set -eux
+
+# Basic dependencies
+dnf update -y
+dnf install -y python3-pip python3 git unzip
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip -q awscliv2.zip
+./aws/install
+
+# App directory
+mkdir -p /opt/myapp
+chown ec2-user:ec2-user /opt/myapp
+
+# Create systemd service for gunicorn app
+cat >/etc/systemd/system/myapp.service <<'EOF'
+[Unit]
+Description=Gunicorn for Flask app
+After=network.target
+
+[Service]
+Type=simple
+Environment="APP_ENV=${APP_ENV}"
+WorkingDirectory=/opt/myapp
+ExecStart=/usr/bin/python3 -m gunicorn -w 2 -b 0.0.0.0:8080 app:app
+Restart=always
+User=ec2-user
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable myapp
+
+# Initial placeholder page
+echo "from flask import Flask\napp = Flask(__name__)\n@app.get('/${APP_ENV}/health')\ndef health(): return 'ok', 200\n" > /opt/myapp/app.py
+
+# Install runtime deps
+pip3 install --upgrade pip gunicorn flask boto3
+
+# Start service
+systemctl start myapp
+
+
+# Install deploy script for SSM deployments
+cat >/opt/myapp/install_app.sh <<'EOS'
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENVIRONMENT="${1:?env required: staging|prod}"
+S3_BUCKET="${2:?artifact bucket name required}"
+S3_KEY="${3:?artifact key path required, e.g. artifacts/staging/abcd123.zip}"
+
+ARTIFACT="/tmp/app.zip"
+APP_DIR="/opt/myapp"
+
+echo "Downloading s3://${S3_BUCKET}/${S3_KEY}..."
+aws s3 cp "s3://${S3_BUCKET}/${S3_KEY}" "${ARTIFACT}"
+
+echo "Stopping service..."
+sudo systemctl stop myapp || true
+
+echo "Extracting..."
+sudo rm -rf "${APP_DIR:?}/*"
+sudo unzip -o "${ARTIFACT}" -d "${APP_DIR}"
+
+echo "Installing deps..."
+sudo pip3 install -r "${APP_DIR}/requirements.txt"
+
+echo "Setting env..."
+sudo bash -c "echo 'PROJECT_NAME=saas-demo' >/etc/myapp.env"
+sudo bash -c "echo 'APP_ENV=${ENVIRONMENT}' >>/etc/myapp.env"
+
+echo "Restarting service..."
+sudo systemctl start myapp
+
+echo "Done."
+
+EOS
+chmod +x /opt/myapp/install_app.sh
