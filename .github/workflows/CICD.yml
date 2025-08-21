@@ -1,0 +1,96 @@
+name: CI-CD
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+  PROJECT_NAME: saas-demo
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: pip install -r app/requirements.txt
+      - run: pytest -q app/tests
+
+  build-and-deploy:
+    if: github.ref == 'refs/heads/develop' || github.event_name == 'release'
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build artifact
+        run: |
+          mkdir -p build
+          cp -r app/src build/app
+          cp app/requirements.txt build/requirements.txt
+          cd build && zip -r app.zip .
+
+      - name: Compute artifact key
+        id: keys
+        run: |
+          SHA=${GITHUB_SHA::7}
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            ENV=prod
+          else
+            ENV=staging
+          fi
+          echo "env=${ENV}" >> $GITHUB_OUTPUT
+          echo "key=artifacts/${ENV}/${SHA}.zip" >> $GITHUB_OUTPUT
+          echo "latest=artifacts/${ENV}/latest.zip" >> $GITHUB_OUTPUT
+
+      - name: Upload artifact to S3 (versioned)
+        run: |
+          aws s3 cp build/app.zip "s3://${{ secrets.ARTIFACT_BUCKET }}/${{ steps.keys.outputs.key }}"
+
+      - name: Deploy via SSM RunCommand
+        run: |
+          # Send command to instances by tag Environment
+          aws ssm send-command             --targets "Key=tag:Environment,Values=${{ steps.keys.outputs.env }}"             --document-name "AWS-RunShellScript"             --comment "Deploy app to ${{ steps.keys.outputs.env }}"             --parameters commands="bash -lc 'sudo bash /opt/myapp/install_app.sh ${{ steps.keys.outputs.env }} ${{ secrets.ARTIFACT_BUCKET }} ${{ steps.keys.outputs.key }}'"             --timeout-seconds 600             --output text
+
+      - name: Health check
+        id: health
+        run: |
+          # get ALB DNS via AWS CLI (simple demo: assume single LB with 'saas-demo' in name)
+          ALB=$(aws elbv2 describe-load-balancers --query "LoadBalancers[?contains(LoadBalancerName, 'saas-demo')].DNSName" --output text | head -n1)
+          echo "ALB=${ALB}"
+          PATH="/${{ steps.keys.outputs.env }}/health"
+          for i in {1..20}; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://${ALB}${PATH}" || true)
+            echo "Attempt $i -> $CODE"
+            if [ "$CODE" = "200" ]; then exit 0; fi
+            sleep 5
+          done
+          exit 1
+
+      - name: Promote latest if healthy
+        if: success()
+        run: |
+          aws s3 cp "s3://${{ secrets.ARTIFACT_BUCKET }}/${{ steps.keys.outputs.key }}" "s3://${{ secrets.ARTIFACT_BUCKET }}/${{ steps.keys.outputs.latest }}"
+
+      - name: Auto-Rollback on failure
+        if: failure()
+        run: |
+          echo "Deploy failed. Rolling back to latest.zip..."
+          aws ssm send-command             --targets "Key=tag:Environment,Values=${{ steps.keys.outputs.env }}"             --document-name "AWS-RunShellScript"             --comment "Rollback app to latest for ${{ steps.keys.outputs.env }}"             --parameters commands="bash -lc 'sudo bash /opt/myapp/install_app.sh ${{ steps.keys.outputs.env }} ${{ secrets.ARTIFACT_BUCKET }} ${{ steps.keys.outputs.latest }}'"             --timeout-seconds 600             --output text
